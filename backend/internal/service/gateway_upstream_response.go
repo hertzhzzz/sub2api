@@ -286,7 +286,7 @@ func ExtractUpstreamErrorMessage(body []byte) string {
 }
 
 func extractUpstreamErrorMessage(body []byte) string {
-	// Claude 风格：{"type":"error","error":{"type":"...","message":"..."}}
+	// Claude / OpenAI 风格：{"type":"error","error":{"type":"...","message":"..."}}
 	if m := gjson.GetBytes(body, "error.message").String(); strings.TrimSpace(m) != "" {
 		inner := strings.TrimSpace(m)
 		// 有些上游会把完整 JSON 作为字符串塞进 message
@@ -296,6 +296,14 @@ func extractUpstreamErrorMessage(body []byte) string {
 			}
 		}
 		return m
+	}
+
+	// xAI / Grok 风格：{"code":"invalid-argument","error":"human readable string"}
+	// gjson treats string "error" as scalar, so error.message is empty above.
+	if errNode := gjson.GetBytes(body, "error"); errNode.Exists() && errNode.Type == gjson.String {
+		if m := strings.TrimSpace(errNode.Str); m != "" {
+			return m
+		}
 	}
 
 	// ChatGPT 内部 API 风格：{"detail":"..."}

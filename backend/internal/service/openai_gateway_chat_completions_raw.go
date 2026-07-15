@@ -145,6 +145,12 @@ func (s *OpenAIGatewayService) forwardAsRawChatCompletions(
 		if err != nil {
 			return nil, fmt.Errorf("remove Responses-only Grok prompt cache key: %w", err)
 		}
+		// Codex / CC Switch tool schemas often use anyOf|null parameter roots
+		// and may exceed xAI's 250-tool limit. Normalize before Grok sees them.
+		upstreamBody, err = sanitizeGrokChatCompletionsTools(upstreamBody)
+		if err != nil {
+			return nil, fmt.Errorf("sanitize grok chat tools: %w", err)
+		}
 	}
 
 	logger.L().Debug("openai chat_completions raw: forwarding without protocol conversion",

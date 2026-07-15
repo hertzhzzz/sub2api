@@ -206,6 +206,95 @@ func TestPatchGrokResponsesBodyDropsToolChoiceWhenNoSupportedToolsRemain(t *test
 	require.False(t, gjson.GetBytes(patched, "tool_choice").Exists())
 }
 
+func TestPatchGrokResponsesBodyCollapsesAnyOfToolParameterRoot(t *testing.T) {
+	t.Parallel()
+
+	// Codex app tools (e.g. automation_update) ship parameter roots as anyOf
+	// unions that include null; xAI rejects those with HTTP 400.
+	body := []byte(`{
+		"model": "grok",
+		"input": "update automation",
+		"tools": [{
+			"type": "function",
+			"name": "codex_app__automation_update",
+			"parameters": {
+				"anyOf": [
+					{"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]},
+					{"type": "null"}
+				]
+			}
+		}]
+	}`)
+
+	patched, err := patchGrokResponsesBody(body, "grok-4.5")
+	require.NoError(t, err)
+	require.True(t, json.Valid(patched))
+	params := gjson.GetBytes(patched, "tools.0.parameters")
+	require.Equal(t, "object", params.Get("type").String())
+	require.False(t, params.Get("anyOf").Exists())
+	require.False(t, params.Get("oneOf").Exists())
+	require.Equal(t, "string", params.Get("properties.id.type").String())
+	require.Equal(t, "id", params.Get("required.0").String())
+}
+
+func TestSanitizeGrokChatCompletionsToolsCollapsesNestedFunctionParameters(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`{
+		"model": "grok-4.5-latest",
+		"messages": [{"role": "user", "content": "update automation"}],
+		"tools": [{
+			"type": "function",
+			"function": {
+				"name": "codex_app__automation_update",
+				"description": "update automation",
+				"parameters": {
+					"oneOf": [
+						{"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]},
+						{"type": "null"}
+					]
+				}
+			}
+		}]
+	}`)
+
+	patched, err := sanitizeGrokChatCompletionsTools(body)
+	require.NoError(t, err)
+	params := gjson.GetBytes(patched, "tools.0.function.parameters")
+	require.Equal(t, "object", params.Get("type").String())
+	require.False(t, params.Get("oneOf").Exists())
+	require.Equal(t, "string", params.Get("properties.id.type").String())
+}
+
+func TestSanitizeGrokChatCompletionsToolsCapsAtMaxTools(t *testing.T) {
+	t.Parallel()
+
+	tools := make([]map[string]any, 0, grokMaxTools+5)
+	for i := 0; i < grokMaxTools+5; i++ {
+		tools = append(tools, map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name":       fmt.Sprintf("tool_%d", i),
+				"parameters": map[string]any{"type": "object", "properties": map[string]any{}},
+			},
+		})
+	}
+	payload := map[string]any{
+		"model":    "grok-4.5-latest",
+		"messages": []map[string]any{{"role": "user", "content": "hi"}},
+		"tools":    tools,
+	}
+	body, err := json.Marshal(payload)
+	require.NoError(t, err)
+
+	patched, err := sanitizeGrokChatCompletionsTools(body)
+	require.NoError(t, err)
+	require.Equal(t, grokMaxTools, len(gjson.GetBytes(patched, "tools").Array()))
+	require.Equal(t, "tool_0", gjson.GetBytes(patched, "tools.0.function.name").String())
+	last := fmt.Sprintf("tools.%d.function.name", grokMaxTools-1)
+	require.Equal(t, fmt.Sprintf("tool_%d", grokMaxTools-1), gjson.GetBytes(patched, last).String())
+}
+
 func TestPatchGrokResponsesBodyDropsCodexAdditionalToolsInputItems(t *testing.T) {
 	t.Parallel()
 

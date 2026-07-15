@@ -349,6 +349,10 @@ var grokResponsesSupportedToolTypes = map[string]struct{}{
 	"x_search":           {},
 }
 
+// grokMaxTools is xAI's hard ceiling for tools[] on Grok chat/responses.
+// Requests above this fail with: "Maximum tools limit reached ... maximum is 250."
+const grokMaxTools = 250
+
 func sanitizeGrokResponsesTools(body []byte) ([]byte, error) {
 	tools := gjson.GetBytes(body, "tools")
 	if !tools.Exists() || !tools.IsArray() {
@@ -359,13 +363,21 @@ func sanitizeGrokResponsesTools(body []byte) ([]byte, error) {
 	filteredTools := make([]json.RawMessage, 0, len(rawTools))
 	for _, tool := range rawTools {
 		toolType := strings.TrimSpace(tool.Get("type").String())
-		if _, ok := grokResponsesSupportedToolTypes[toolType]; ok {
-			filteredTools = append(filteredTools, json.RawMessage(tool.Raw))
+		if _, ok := grokResponsesSupportedToolTypes[toolType]; !ok {
+			continue
 		}
+		normalized, err := normalizeGrokToolDefinition(json.RawMessage(tool.Raw))
+		if err != nil {
+			return nil, err
+		}
+		filteredTools = append(filteredTools, normalized)
+	}
+	if len(filteredTools) > grokMaxTools {
+		filteredTools = filteredTools[:grokMaxTools]
 	}
 
 	var err error
-	if len(filteredTools) != len(rawTools) {
+	if len(filteredTools) != len(rawTools) || toolsNeedRewrite(rawTools, filteredTools) {
 		if len(filteredTools) == 0 {
 			body, err = sjson.DeleteBytes(body, "tools")
 		} else {
@@ -392,6 +404,165 @@ func sanitizeGrokResponsesTools(body []byte) ([]byte, error) {
 		}
 	}
 	return body, nil
+}
+
+// sanitizeGrokChatCompletionsTools normalizes Chat Completions tools[] for Grok:
+// collapse anyOf/oneOf parameter roots to pure objects, and cap tool count.
+func sanitizeGrokChatCompletionsTools(body []byte) ([]byte, error) {
+	tools := gjson.GetBytes(body, "tools")
+	if !tools.Exists() || !tools.IsArray() {
+		return body, nil
+	}
+
+	rawTools := tools.Array()
+	normalized := make([]json.RawMessage, 0, len(rawTools))
+	changed := false
+	for i, tool := range rawTools {
+		next, err := normalizeGrokToolDefinition(json.RawMessage(tool.Raw))
+		if err != nil {
+			return nil, err
+		}
+		if string(next) != tool.Raw {
+			changed = true
+		}
+		normalized = append(normalized, next)
+		_ = i
+	}
+	if len(normalized) > grokMaxTools {
+		normalized = normalized[:grokMaxTools]
+		changed = true
+	}
+	if !changed {
+		return body, nil
+	}
+	encoded, err := json.Marshal(normalized)
+	if err != nil {
+		return nil, err
+	}
+	return sjson.SetRawBytes(body, "tools", encoded)
+}
+
+func toolsNeedRewrite(original []gjson.Result, normalized []json.RawMessage) bool {
+	if len(original) != len(normalized) {
+		return true
+	}
+	for i := range original {
+		if original[i].Raw != string(normalized[i]) {
+			return true
+		}
+	}
+	return false
+}
+
+// normalizeGrokToolDefinition collapses non-object parameter roots that xAI rejects.
+// Supports both Responses ({"type":"function","parameters":...}) and Chat Completions
+// ({"type":"function","function":{"parameters":...}}) shapes.
+func normalizeGrokToolDefinition(raw json.RawMessage) (json.RawMessage, error) {
+	var tool map[string]any
+	if err := json.Unmarshal(raw, &tool); err != nil {
+		return raw, nil
+	}
+	changed := false
+
+	if params, ok := tool["parameters"]; ok {
+		if next, did := collapseGrokToolParameterSchema(params); did {
+			tool["parameters"] = next
+			changed = true
+		}
+	}
+	if fn, ok := tool["function"].(map[string]any); ok {
+		if params, ok := fn["parameters"]; ok {
+			if next, did := collapseGrokToolParameterSchema(params); did {
+				fn["parameters"] = next
+				tool["function"] = fn
+				changed = true
+			}
+		}
+	}
+	if !changed {
+		return raw, nil
+	}
+	return json.Marshal(tool)
+}
+
+// collapseGrokToolParameterSchema ensures the tool parameter root is a pure object.
+// xAI rejects anyOf/oneOf roots that include a non-object branch (e.g. null).
+func collapseGrokToolParameterSchema(params any) (any, bool) {
+	root, ok := params.(map[string]any)
+	if !ok {
+		return map[string]any{"type": "object", "properties": map[string]any{}}, true
+	}
+
+	typeVal, hasType := root["type"]
+	if isObjectType(typeVal) {
+		return root, false
+	}
+
+	for _, key := range []string{"anyOf", "oneOf", "allOf"} {
+		union, ok := root[key].([]any)
+		if !ok || len(union) == 0 {
+			continue
+		}
+		if branch, found := firstObjectSchemaBranch(union); found {
+			return branch, true
+		}
+		// Union present but no object branch — fall back to empty object.
+		return map[string]any{"type": "object", "properties": map[string]any{}}, true
+	}
+
+	// Non-object type without a usable union (e.g. "type":"null").
+	if hasType && !isObjectType(typeVal) {
+		return map[string]any{"type": "object", "properties": map[string]any{}}, true
+	}
+	// Schema missing type but has properties — treat as object.
+	if _, hasProps := root["properties"]; hasProps {
+		out := make(map[string]any, len(root)+1)
+		for k, v := range root {
+			out[k] = v
+		}
+		out["type"] = "object"
+		return out, true
+	}
+	return root, false
+}
+
+func firstObjectSchemaBranch(union []any) (map[string]any, bool) {
+	for _, item := range union {
+		branch, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		if isObjectType(branch["type"]) {
+			return branch, true
+		}
+		// Branch may omit type but declare properties/required.
+		if _, hasProps := branch["properties"]; hasProps {
+			out := make(map[string]any, len(branch)+1)
+			for k, v := range branch {
+				out[k] = v
+			}
+			if _, hasType := out["type"]; !hasType {
+				out["type"] = "object"
+			}
+			return out, true
+		}
+	}
+	return nil, false
+}
+
+func isObjectType(typeVal any) bool {
+	switch v := typeVal.(type) {
+	case string:
+		return strings.EqualFold(strings.TrimSpace(v), "object")
+	case []any:
+		for _, item := range v {
+			s, ok := item.(string)
+			if ok && strings.EqualFold(strings.TrimSpace(s), "object") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func shouldDropGrokToolChoice(toolChoice gjson.Result, tools []json.RawMessage) bool {
