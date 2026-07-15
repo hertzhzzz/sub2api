@@ -49,8 +49,11 @@ wrapped that as â€œlocal proxy failed while handling Codex endpoint /responsesâ€
 - **Trade-off:** Union alternatives beyond the first object branch are dropped;
   tools beyond index 249 are dropped. Acceptable for proxy compatibility;
   not a full JSON Schema rewrite engine.
+- **Follow-up (2026-07-15):** Collapsing anyOf without copying parent `$defs`
+  caused xAI `unresolvable $ref '#/$defs/__schema0'`. Collapse now merges
+  parent `$defs` / `$definitions` onto the chosen object branch.
 - **Tests:** unit coverage in `openai_gateway_grok_test.go` and
-  `gateway_upstream_error_message_test.go`.
+  `gateway_upstream_error_message_test.go` (including defs-preserving collapse).
 
 ## References
 

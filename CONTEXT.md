@@ -10,7 +10,7 @@ vocabulary map.
 | **Grok tool root** | Function tool `parameters` root must be a pure JSON Schema `object`. xAI rejects `anyOf`/`oneOf` roots that include non-object branches (e.g. `null`). |
 | **Grok max tools** | Hard limit **250** tools per request. |
 | **xAI error shape** | `{"code":"...","error":"<string>"}` — not OpenAI’s nested `error.message`. |
-| **Tool schema sanitization** | Pre-forward collapse of non-object parameter roots + tool cap. See [ADR 0001](docs/adr/0001-grok-tool-schema-sanitization.md). |
+| **Tool schema sanitization** | Pre-forward collapse of non-object parameter roots + tool cap. When collapsing anyOf, **parent `$defs` must move onto the chosen branch** so `$ref` still resolves. See [ADR 0001](docs/adr/0001-grok-tool-schema-sanitization.md). |
 
 ## Client path (local Mark setup)
 

@@ -487,6 +487,10 @@ func normalizeGrokToolDefinition(raw json.RawMessage) (json.RawMessage, error) {
 
 // collapseGrokToolParameterSchema ensures the tool parameter root is a pure object.
 // xAI rejects anyOf/oneOf roots that include a non-object branch (e.g. null).
+//
+// When collapsing a union branch, parent-level $defs / $definitions are merged
+// onto the chosen branch so $ref pointers like "#/$defs/__schema0" still resolve
+// (Codex places defs on the anyOf wrapper, not inside each branch).
 func collapseGrokToolParameterSchema(params any) (any, bool) {
 	root, ok := params.(map[string]any)
 	if !ok {
@@ -504,10 +508,12 @@ func collapseGrokToolParameterSchema(params any) (any, bool) {
 			continue
 		}
 		if branch, found := firstObjectSchemaBranch(union); found {
-			return branch, true
+			return mergeParentSchemaDefs(root, branch), true
 		}
-		// Union present but no object branch — fall back to empty object.
-		return map[string]any{"type": "object", "properties": map[string]any{}}, true
+		// Union present but no object branch — fall back to empty object,
+		// still keeping parent defs in case callers inspect refs later.
+		fallback := map[string]any{"type": "object", "properties": map[string]any{}}
+		return mergeParentSchemaDefs(root, fallback), true
 	}
 
 	// Non-object type without a usable union (e.g. "type":"null").
@@ -516,10 +522,7 @@ func collapseGrokToolParameterSchema(params any) (any, bool) {
 	}
 	// Schema missing type but has properties — treat as object.
 	if _, hasProps := root["properties"]; hasProps {
-		out := make(map[string]any, len(root)+1)
-		for k, v := range root {
-			out[k] = v
-		}
+		out := cloneJSONMap(root)
 		out["type"] = "object"
 		return out, true
 	}
@@ -533,14 +536,11 @@ func firstObjectSchemaBranch(union []any) (map[string]any, bool) {
 			continue
 		}
 		if isObjectType(branch["type"]) {
-			return branch, true
+			return cloneJSONMap(branch), true
 		}
 		// Branch may omit type but declare properties/required.
 		if _, hasProps := branch["properties"]; hasProps {
-			out := make(map[string]any, len(branch)+1)
-			for k, v := range branch {
-				out[k] = v
-			}
+			out := cloneJSONMap(branch)
 			if _, hasType := out["type"]; !hasType {
 				out["type"] = "object"
 			}
@@ -548,6 +548,53 @@ func firstObjectSchemaBranch(union []any) (map[string]any, bool) {
 		}
 	}
 	return nil, false
+}
+
+// mergeParentSchemaDefs copies $defs / $definitions from parent onto branch when
+// the branch lacks them (or merges keys when both define maps).
+func mergeParentSchemaDefs(parent, branch map[string]any) map[string]any {
+	if branch == nil {
+		branch = map[string]any{}
+	}
+	out := cloneJSONMap(branch)
+	for _, key := range []string{"$defs", "$definitions"} {
+		parentDefs, parentOK := parent[key]
+		if !parentOK {
+			continue
+		}
+		parentMap, parentIsMap := parentDefs.(map[string]any)
+		if !parentIsMap {
+			if _, exists := out[key]; !exists {
+				out[key] = parentDefs
+			}
+			continue
+		}
+		branchDefs, branchOK := out[key]
+		branchMap, branchIsMap := branchDefs.(map[string]any)
+		if !branchOK || !branchIsMap {
+			out[key] = cloneJSONMap(parentMap)
+			continue
+		}
+		merged := cloneJSONMap(branchMap)
+		for k, v := range parentMap {
+			if _, exists := merged[k]; !exists {
+				merged[k] = v
+			}
+		}
+		out[key] = merged
+	}
+	return out
+}
+
+func cloneJSONMap(in map[string]any) map[string]any {
+	if in == nil {
+		return map[string]any{}
+	}
+	out := make(map[string]any, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
 }
 
 func isObjectType(typeVal any) bool {

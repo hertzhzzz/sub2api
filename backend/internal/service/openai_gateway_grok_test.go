@@ -266,6 +266,85 @@ func TestSanitizeGrokChatCompletionsToolsCollapsesNestedFunctionParameters(t *te
 	require.Equal(t, "string", params.Get("properties.id.type").String())
 }
 
+func TestCollapseGrokToolParameterSchemaPreservesParentDefsWithRefs(t *testing.T) {
+	t.Parallel()
+
+	// Codex schemas often put $defs on the anyOf root while object branches
+	// reference them via $ref. Dropping $defs caused xAI:
+	// unresolvable $ref '#/$defs/__schema0': key '$defs' not found
+	params := map[string]any{
+		"anyOf": []any{
+			map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"id": map[string]any{"$ref": "#/$defs/__schema0"},
+				},
+				"required": []any{"id"},
+			},
+			map[string]any{"type": "null"},
+		},
+		"$defs": map[string]any{
+			"__schema0": map[string]any{"type": "string"},
+		},
+	}
+
+	collapsed, did := collapseGrokToolParameterSchema(params)
+	require.True(t, did)
+	root, ok := collapsed.(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "object", root["type"])
+	_, hasAnyOf := root["anyOf"]
+	require.False(t, hasAnyOf)
+
+	defs, ok := root["$defs"].(map[string]any)
+	require.True(t, ok, "parent $defs must survive collapse")
+	schema0, ok := defs["__schema0"].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "string", schema0["type"])
+
+	props, ok := root["properties"].(map[string]any)
+	require.True(t, ok)
+	idProp, ok := props["id"].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "#/$defs/__schema0", idProp["$ref"])
+}
+
+func TestSanitizeGrokChatCompletionsToolsPreservesDefsOnCollapsedAnyOf(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`{
+		"model": "grok-4.5-latest",
+		"messages": [{"role": "user", "content": "hi"}],
+		"tools": [{
+			"type": "function",
+			"function": {
+				"name": "codex_app__automation_update",
+				"parameters": {
+					"anyOf": [
+						{
+							"type": "object",
+							"properties": {"id": {"$ref": "#/$defs/__schema0"}},
+							"required": ["id"]
+						},
+						{"type": "null"}
+					],
+					"$defs": {
+						"__schema0": {"type": "string"}
+					}
+				}
+			}
+		}]
+	}`)
+
+	patched, err := sanitizeGrokChatCompletionsTools(body)
+	require.NoError(t, err)
+	params := gjson.GetBytes(patched, "tools.0.function.parameters")
+	require.Equal(t, "object", params.Get("type").String())
+	require.False(t, params.Get("anyOf").Exists())
+	require.Equal(t, "#/$defs/__schema0", params.Get("properties.id.$ref").String())
+	require.Equal(t, "string", params.Get("$defs.__schema0.type").String())
+}
+
 func TestSanitizeGrokChatCompletionsToolsCapsAtMaxTools(t *testing.T) {
 	t.Parallel()
 
